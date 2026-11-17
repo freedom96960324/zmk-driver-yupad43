@@ -193,6 +193,7 @@ struct iqs9151_data {
     struct k_work_delayable three_finger_click_work;
     struct k_work_delayable inertia_scroll_work;
     struct k_work_delayable inertia_cursor_work;
+    struct k_work_delayable reinit_work;
     struct iqs9151_inertia_state inertia_scroll;
     struct iqs9151_inertia_state inertia_cursor;
     int32_t scroll_ema_x_fp;
@@ -1920,6 +1921,8 @@ static bool iqs9151_handle_show_reset(struct iqs9151_data *data,
     }
 
     LOG_WRN("SHOW_RESET detected: info=0x%04x", frame->info_flags);
+    /* The pad reset itself: set it up again (once per reset). */
+    k_work_schedule(&data->reinit_work, K_MSEC(20));
     iqs9151_reset_gesture_states(data, dev, true);
     iqs9151_inertia_cancel(&data->inertia_scroll, &data->inertia_scroll_work);
     iqs9151_inertia_cancel(&data->inertia_cursor, &data->inertia_cursor_work);
@@ -2540,6 +2543,47 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
     return 0;
 }
 
+/* Re-initialize after the pad reset itself while running. */
+static void iqs9151_reinit_work_cb(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct iqs9151_data *data = CONTAINER_OF(dwork, struct iqs9151_data, reinit_work);
+    const struct device *dev = data->dev;
+    const struct iqs9151_config *cfg = dev->config;
+    int ret;
+
+    LOG_WRN("re-initializing after pad reset");
+    iqs9151_set_interrupt(dev, false);
+
+    iqs9151_wait_for_ready(dev, 500);
+    ret = iqs9151_ack_reset(dev);
+    if (ret == 0) {
+        iqs9151_wait_for_ready(dev, 500);
+        ret = iqs9151_configure(dev);
+    }
+    if (ret == 0) {
+        iqs9151_wait_for_ready(dev, 100);
+        ret = iqs9151_apply_kconfig_overrides(dev);
+    }
+    if (ret == 0) {
+        iqs9151_wait_for_ready(dev, 100);
+        ret = iqs9151_run_ati(cfg);
+    }
+    if (ret == 0) {
+        ret = iqs9151_wait_for_ati(dev, IQS9151_ATI_TIMEOUT_MS);
+    }
+    if (ret == 0) {
+        iqs9151_wait_for_ready(dev, 100);
+        ret = iqs9151_set_event_mode(dev);
+    }
+
+    iqs9151_set_interrupt(dev, true);
+
+    if (ret != 0) {
+        LOG_ERR("re-initialization failed (%d), retrying", ret);
+        k_work_schedule(&data->reinit_work, K_MSEC(1000));
+    }
+}
+
 static int iqs9151_init(const struct device *dev) {
     const struct iqs9151_config *cfg = dev->config;
     struct iqs9151_data *data = dev->data;
@@ -2639,6 +2683,7 @@ static int iqs9151_init(const struct device *dev) {
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
     k_work_init_delayable(&data->inertia_scroll_work, iqs9151_inertia_scroll_work_cb);
     k_work_init_delayable(&data->inertia_cursor_work, iqs9151_inertia_cursor_work_cb);
+    k_work_init_delayable(&data->reinit_work, iqs9151_reinit_work_cb);
     iqs9151_inertia_state_reset(&data->inertia_scroll);
     iqs9151_inertia_state_reset(&data->inertia_cursor);
     iqs9151_ema_reset(&data->scroll_ema_x_fp, &data->scroll_ema_y_fp);
@@ -2697,6 +2742,7 @@ void iqs9151_test_context_init(void *ctx, const struct device *dev) {
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
     k_work_init_delayable(&data->inertia_scroll_work, iqs9151_inertia_scroll_work_cb);
     k_work_init_delayable(&data->inertia_cursor_work, iqs9151_inertia_cursor_work_cb);
+    k_work_init_delayable(&data->reinit_work, iqs9151_reinit_work_cb);
     iqs9151_inertia_state_reset(&data->inertia_scroll);
     iqs9151_inertia_state_reset(&data->inertia_cursor);
     iqs9151_ema_reset(&data->scroll_ema_x_fp, &data->scroll_ema_y_fp);
