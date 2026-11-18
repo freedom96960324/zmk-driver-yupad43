@@ -16,6 +16,22 @@
 #include "iqs9151_regs.h"
 #include "iqs9151_test.h"
 
+/*
+ * Run all of this driver's work items on a dedicated work queue instead of
+ * the system work queue. The pad closes its communication window if the host
+ * does not read it soon after RDY goes low; on a split central the system
+ * work queue is busy with BLE/USB/split work and can be late. A cooperative
+ * priority higher than the system work queue lets the frame read run first.
+ */
+#define IQS9151_WQ_STACK_SIZE 2048
+#define IQS9151_WQ_PRIORITY (-3)
+K_THREAD_STACK_DEFINE(iqs9151_wq_stack, IQS9151_WQ_STACK_SIZE);
+static struct k_work_q iqs9151_wq;
+static bool iqs9151_wq_started;
+#define k_work_submit(work) k_work_submit_to_queue(&iqs9151_wq, (work))
+#define k_work_schedule(dwork, delay) k_work_schedule_for_queue(&iqs9151_wq, (dwork), (delay))
+#define k_work_reschedule(dwork, delay) k_work_reschedule_for_queue(&iqs9151_wq, (dwork), (delay))
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -193,8 +209,6 @@ struct iqs9151_data {
     struct k_work_delayable three_finger_click_work;
     struct k_work_delayable inertia_scroll_work;
     struct k_work_delayable inertia_cursor_work;
-    struct k_work_delayable reinit_work;
-    uint8_t reinit_attempts;
     struct iqs9151_inertia_state inertia_scroll;
     struct iqs9151_inertia_state inertia_cursor;
     int32_t scroll_ema_x_fp;
@@ -1922,8 +1936,6 @@ static bool iqs9151_handle_show_reset(struct iqs9151_data *data,
     }
 
     LOG_WRN("SHOW_RESET detected: info=0x%04x", frame->info_flags);
-    /* The pad reset itself: set it up again (once per reset). */
-    k_work_schedule(&data->reinit_work, K_MSEC(20));
     iqs9151_reset_gesture_states(data, dev, true);
     iqs9151_inertia_cancel(&data->inertia_scroll, &data->inertia_scroll_work);
     iqs9151_inertia_cancel(&data->inertia_cursor, &data->inertia_cursor_work);
@@ -2263,10 +2275,7 @@ static void iqs9151_work_cb(struct k_work *work) {
 
     ret = iqs9151_read_frame(cfg, &frame);
     if (ret != 0) {
-        /* After a broken transfer the pad goes silent (Zephyr already
-         * recovers the bus on timeouts). Set the pad up again. */
-        LOG_ERR("frame read failed (%d): re-initializing", ret);
-        k_work_schedule(&data->reinit_work, K_MSEC(200));
+        LOG_ERR("frame read failed (%d)", ret);
         return;
     }
 
@@ -2547,69 +2556,18 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
     return 0;
 }
 
-/* Re-initialize after the pad reset itself or the I2C bus got stuck. */
-#define IQS9151_REINIT_MAX_ATTEMPTS 5
-static void iqs9151_reinit_work_cb(struct k_work *work) {
-    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
-    struct iqs9151_data *data = CONTAINER_OF(dwork, struct iqs9151_data, reinit_work);
-    const struct device *dev = data->dev;
-    const struct iqs9151_config *cfg = dev->config;
-    int ret;
-
-    LOG_WRN("re-initializing (attempt %d)", data->reinit_attempts + 1);
-    iqs9151_set_interrupt(dev, false);
-    iqs9151_reset_gesture_states(data, dev, true);
-
-    iqs9151_wait_for_ready(dev, 500);
-    ret = iqs9151_sw_reset(dev);
-    if (ret == 0) {
-        iqs9151_wait_for_ready(dev, 500);
-        ret = iqs9151_ack_reset(dev);
-    }
-    if (ret == 0) {
-        iqs9151_wait_for_ready(dev, 500);
-        ret = iqs9151_configure(dev);
-    }
-    if (ret == 0) {
-        iqs9151_wait_for_ready(dev, 100);
-        ret = iqs9151_apply_kconfig_overrides(dev);
-    }
-    if (ret == 0) {
-        iqs9151_wait_for_ready(dev, 100);
-        ret = iqs9151_run_ati(cfg);
-    }
-    if (ret == 0) {
-        ret = iqs9151_wait_for_ati(dev, IQS9151_ATI_TIMEOUT_MS);
-    }
-    if (ret == 0) {
-        iqs9151_wait_for_ready(dev, 100);
-        ret = iqs9151_set_event_mode(dev);
-    }
-
-    iqs9151_set_interrupt(dev, true);
-
-    if (ret == 0) {
-        LOG_WRN("re-initialization done");
-        data->reinit_attempts = 0;
-        return;
-    }
-
-    data->reinit_attempts++;
-    if (data->reinit_attempts < IQS9151_REINIT_MAX_ATTEMPTS) {
-        LOG_ERR("re-initialization failed (%d), retrying", ret);
-        /* Long gap so keys and BLE keep running between attempts. */
-        k_work_schedule(&data->reinit_work, K_MSEC(2000));
-    } else {
-        LOG_ERR("re-initialization failed (%d), giving up", ret);
-        data->reinit_attempts = 0;
-    }
-}
-
 static int iqs9151_init(const struct device *dev) {
     const struct iqs9151_config *cfg = dev->config;
     struct iqs9151_data *data = dev->data;
     int ret;
     data->dev = dev;
+
+    if (!iqs9151_wq_started) {
+        k_work_queue_start(&iqs9151_wq, iqs9151_wq_stack,
+                           K_THREAD_STACK_SIZEOF(iqs9151_wq_stack), IQS9151_WQ_PRIORITY, NULL);
+        k_thread_name_set(&iqs9151_wq.thread, "iqs9151_wq");
+        iqs9151_wq_started = true;
+    }
 
     LOG_DBG("Initialization Start");
 
@@ -2633,18 +2591,8 @@ static int iqs9151_init(const struct device *dev) {
 
     iqs9151_wait_for_ready(dev, 500);
     
-    /* The pad keeps power across an XIAO reset and can still be stuck in a
-     * broken transfer. Each failed transfer makes Zephyr clock the bus free,
-     * so retry a few times instead of giving up on the first failure. */
-    for (int attempt = 0; attempt < 10; attempt++) {
-        ret = iqs9151_check_product_number(dev);
-        if (ret == 0) {
-            break;
-        }
-        LOG_WRN("product number read failed (%d), retry %d", ret, attempt + 1);
-        k_msleep(50);
-        iqs9151_wait_for_ready(dev, 200);
-    }
+    // Check Product Number
+    ret = iqs9151_check_product_number(dev);
     if (ret != 0) {
         return ret;
     }
@@ -2714,7 +2662,6 @@ static int iqs9151_init(const struct device *dev) {
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
     k_work_init_delayable(&data->inertia_scroll_work, iqs9151_inertia_scroll_work_cb);
     k_work_init_delayable(&data->inertia_cursor_work, iqs9151_inertia_cursor_work_cb);
-    k_work_init_delayable(&data->reinit_work, iqs9151_reinit_work_cb);
     iqs9151_inertia_state_reset(&data->inertia_scroll);
     iqs9151_inertia_state_reset(&data->inertia_cursor);
     iqs9151_ema_reset(&data->scroll_ema_x_fp, &data->scroll_ema_y_fp);
@@ -2773,7 +2720,6 @@ void iqs9151_test_context_init(void *ctx, const struct device *dev) {
     k_work_init_delayable(&data->three_finger_click_work, iqs9151_three_finger_click_work_cb);
     k_work_init_delayable(&data->inertia_scroll_work, iqs9151_inertia_scroll_work_cb);
     k_work_init_delayable(&data->inertia_cursor_work, iqs9151_inertia_cursor_work_cb);
-    k_work_init_delayable(&data->reinit_work, iqs9151_reinit_work_cb);
     iqs9151_inertia_state_reset(&data->inertia_scroll);
     iqs9151_inertia_state_reset(&data->inertia_cursor);
     iqs9151_ema_reset(&data->scroll_ema_x_fp, &data->scroll_ema_y_fp);
