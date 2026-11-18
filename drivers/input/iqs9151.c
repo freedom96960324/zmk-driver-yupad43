@@ -2263,12 +2263,10 @@ static void iqs9151_work_cb(struct k_work *work) {
 
     ret = iqs9151_read_frame(cfg, &frame);
     if (ret != 0) {
-        /* A broken transfer can leave the pad holding SDA low, after which
-         * every read fails and the pad goes silent. Free the bus and set
-         * the pad up again instead of giving up. */
-        LOG_ERR("frame read failed (%d): recovering", ret);
-        (void)i2c_recover_bus(cfg->i2c.bus);
-        k_work_schedule(&data->reinit_work, K_MSEC(100));
+        /* After a broken transfer the pad goes silent (Zephyr already
+         * recovers the bus on timeouts). Set the pad up again. */
+        LOG_ERR("frame read failed (%d): re-initializing", ret);
+        k_work_schedule(&data->reinit_work, K_MSEC(200));
         return;
     }
 
@@ -2561,8 +2559,6 @@ static void iqs9151_reinit_work_cb(struct k_work *work) {
     LOG_WRN("re-initializing (attempt %d)", data->reinit_attempts + 1);
     iqs9151_set_interrupt(dev, false);
     iqs9151_reset_gesture_states(data, dev, true);
-
-    (void)i2c_recover_bus(cfg->i2c.bus);
 
     iqs9151_wait_for_ready(dev, 500);
     ret = iqs9151_sw_reset(dev);
