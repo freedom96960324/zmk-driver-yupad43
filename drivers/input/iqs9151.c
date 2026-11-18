@@ -2633,8 +2633,18 @@ static int iqs9151_init(const struct device *dev) {
 
     iqs9151_wait_for_ready(dev, 500);
     
-    // Check Product Number
-    ret = iqs9151_check_product_number(dev);
+    /* The pad keeps power across an XIAO reset and can still be stuck in a
+     * broken transfer. Each failed transfer makes Zephyr clock the bus free,
+     * so retry a few times instead of giving up on the first failure. */
+    for (int attempt = 0; attempt < 10; attempt++) {
+        ret = iqs9151_check_product_number(dev);
+        if (ret == 0) {
+            break;
+        }
+        LOG_WRN("product number read failed (%d), retry %d", ret, attempt + 1);
+        k_msleep(50);
+        iqs9151_wait_for_ready(dev, 200);
+    }
     if (ret != 0) {
         return ret;
     }
