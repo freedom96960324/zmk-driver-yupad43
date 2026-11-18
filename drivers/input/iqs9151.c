@@ -194,6 +194,7 @@ struct iqs9151_data {
     struct k_work_delayable inertia_scroll_work;
     struct k_work_delayable inertia_cursor_work;
     struct k_work_delayable reinit_work;
+    uint8_t reinit_attempts;
     struct iqs9151_inertia_state inertia_scroll;
     struct iqs9151_inertia_state inertia_cursor;
     int32_t scroll_ema_x_fp;
@@ -2262,7 +2263,12 @@ static void iqs9151_work_cb(struct k_work *work) {
 
     ret = iqs9151_read_frame(cfg, &frame);
     if (ret != 0) {
-        LOG_ERR("frame read failed (%d)", ret);
+        /* A broken transfer can leave the pad holding SDA low, after which
+         * every read fails and the pad goes silent. Free the bus and set
+         * the pad up again instead of giving up. */
+        LOG_ERR("frame read failed (%d): recovering", ret);
+        (void)i2c_recover_bus(cfg->i2c.bus);
+        k_work_schedule(&data->reinit_work, K_MSEC(100));
         return;
     }
 
@@ -2543,7 +2549,8 @@ static int iqs9151_apply_kconfig_overrides(const struct device *dev) {
     return 0;
 }
 
-/* Re-initialize after the pad reset itself while running. */
+/* Re-initialize after the pad reset itself or the I2C bus got stuck. */
+#define IQS9151_REINIT_MAX_ATTEMPTS 5
 static void iqs9151_reinit_work_cb(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct iqs9151_data *data = CONTAINER_OF(dwork, struct iqs9151_data, reinit_work);
@@ -2551,11 +2558,18 @@ static void iqs9151_reinit_work_cb(struct k_work *work) {
     const struct iqs9151_config *cfg = dev->config;
     int ret;
 
-    LOG_WRN("re-initializing after pad reset");
+    LOG_WRN("re-initializing (attempt %d)", data->reinit_attempts + 1);
     iqs9151_set_interrupt(dev, false);
+    iqs9151_reset_gesture_states(data, dev, true);
+
+    (void)i2c_recover_bus(cfg->i2c.bus);
 
     iqs9151_wait_for_ready(dev, 500);
-    ret = iqs9151_ack_reset(dev);
+    ret = iqs9151_sw_reset(dev);
+    if (ret == 0) {
+        iqs9151_wait_for_ready(dev, 500);
+        ret = iqs9151_ack_reset(dev);
+    }
     if (ret == 0) {
         iqs9151_wait_for_ready(dev, 500);
         ret = iqs9151_configure(dev);
@@ -2578,9 +2592,20 @@ static void iqs9151_reinit_work_cb(struct k_work *work) {
 
     iqs9151_set_interrupt(dev, true);
 
-    if (ret != 0) {
+    if (ret == 0) {
+        LOG_WRN("re-initialization done");
+        data->reinit_attempts = 0;
+        return;
+    }
+
+    data->reinit_attempts++;
+    if (data->reinit_attempts < IQS9151_REINIT_MAX_ATTEMPTS) {
         LOG_ERR("re-initialization failed (%d), retrying", ret);
-        k_work_schedule(&data->reinit_work, K_MSEC(1000));
+        /* Long gap so keys and BLE keep running between attempts. */
+        k_work_schedule(&data->reinit_work, K_MSEC(2000));
+    } else {
+        LOG_ERR("re-initialization failed (%d), giving up", ret);
+        data->reinit_attempts = 0;
     }
 }
 
